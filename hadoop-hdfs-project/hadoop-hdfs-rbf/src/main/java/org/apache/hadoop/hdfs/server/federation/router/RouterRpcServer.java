@@ -77,6 +77,7 @@ import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.DirectoryListing;
 import org.apache.hadoop.hdfs.protocol.ECBlockGroupStats;
+import org.apache.hadoop.hdfs.protocol.ECTopologyVerifierResult;
 import org.apache.hadoop.hdfs.protocol.EncryptionZone;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicyInfo;
@@ -156,7 +157,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.protobuf.BlockingService;
+import org.apache.hadoop.thirdparty.protobuf.BlockingService;
 
 /**
  * This class is responsible for handling all of the RPC calls to the It is
@@ -653,12 +654,6 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
         }
       } catch (FileNotFoundException fne) {
         // Ignore if the file is not found
-      } catch (IOException ioe) {
-        if (RouterRpcClient.isUnavailableException(ioe)) {
-          LOG.debug("Ignore unavailable exception: {}", ioe);
-        } else {
-          throw ioe;
-        }
       }
     }
     return createLocation;
@@ -676,7 +671,7 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
     RemoteMethod method = new RemoteMethod("getFileInfo",
         new Class<?>[] {String.class}, new RemoteParam());
     Map<RemoteLocation, HdfsFileStatus> results = rpcClient.invokeConcurrent(
-        locations, method, false, false, HdfsFileStatus.class);
+        locations, method, true, false, HdfsFileStatus.class);
     for (RemoteLocation loc : locations) {
       if (results.get(loc) != null) {
         return loc;
@@ -1307,6 +1302,12 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
   @Override // ClientProtocol
   public void unsetErasureCodingPolicy(String src) throws IOException {
     clientProto.unsetErasureCodingPolicy(src);
+  }
+
+  @Override
+  public ECTopologyVerifierResult getECTopologyResultForPolicies(
+      String... policyNames) throws IOException {
+    return clientProto.getECTopologyResultForPolicies(policyNames);
   }
 
   @Override // ClientProtocol

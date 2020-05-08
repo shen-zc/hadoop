@@ -25,6 +25,7 @@ import java.io.PrintStream;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.AccessDeniedException;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
@@ -73,6 +74,7 @@ import static org.apache.hadoop.fs.s3a.S3AUtils.clearBucketOption;
 import static org.apache.hadoop.fs.s3a.S3AUtils.propagateBucketOptions;
 import static org.apache.hadoop.fs.s3a.commit.CommitConstants.*;
 import static org.apache.hadoop.fs.s3a.commit.staging.StagingCommitterConstants.FILESYSTEM_TEMP_PATH;
+import static org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStoreTableManager.SSE_DEFAULT_MASTER_KEY;
 import static org.apache.hadoop.service.launcher.LauncherExitCodes.*;
 
 /**
@@ -143,6 +145,8 @@ public abstract class S3GuardTool extends Configured implements Tool,
   public static final String REGION_FLAG = "region";
   public static final String READ_FLAG = "read";
   public static final String WRITE_FLAG = "write";
+  public static final String SSE_FLAG = "sse";
+  public static final String CMK_FLAG = "cmk";
   public static final String TAG_FLAG = "tag";
 
   public static final String VERBOSE = "verbose";
@@ -509,6 +513,8 @@ public abstract class S3GuardTool extends Configured implements Tool,
         "  -" + REGION_FLAG + " REGION - Service region for connections\n" +
         "  -" + READ_FLAG + " UNIT - Provisioned read throughput units\n" +
         "  -" + WRITE_FLAG + " UNIT - Provisioned write through put units\n" +
+        "  -" + SSE_FLAG + " - Enable server side encryption\n" +
+        "  -" + CMK_FLAG + " KEY - Customer managed CMK\n" +
         "  -" + TAG_FLAG + " key=value; list of tags to tag dynamo table\n" +
         "\n" +
         "  URLs for Amazon DynamoDB are of the form dynamodb://TABLE_NAME.\n" +
@@ -518,11 +524,13 @@ public abstract class S3GuardTool extends Configured implements Tool,
         + "capacities to 0";
 
     Init(Configuration conf) {
-      super(conf);
+      super(conf, SSE_FLAG);
       // read capacity.
       getCommandFormat().addOptionWithValue(READ_FLAG);
       // write capacity.
       getCommandFormat().addOptionWithValue(WRITE_FLAG);
+      // customer managed customer master key (CMK) for server side encryption
+      getCommandFormat().addOptionWithValue(CMK_FLAG);
       // tag
       getCommandFormat().addOptionWithValue(TAG_FLAG);
     }
@@ -546,13 +554,13 @@ public abstract class S3GuardTool extends Configured implements Tool,
         errorln(USAGE);
         throw e;
       }
-
-      String readCap = getCommandFormat().getOptValue(READ_FLAG);
+      CommandFormat commands = getCommandFormat();
+      String readCap = commands.getOptValue(READ_FLAG);
       if (readCap != null && !readCap.isEmpty()) {
         int readCapacity = Integer.parseInt(readCap);
         getConf().setInt(S3GUARD_DDB_TABLE_CAPACITY_READ_KEY, readCapacity);
       }
-      String writeCap = getCommandFormat().getOptValue(WRITE_FLAG);
+      String writeCap = commands.getOptValue(WRITE_FLAG);
       if (writeCap != null && !writeCap.isEmpty()) {
         int writeCapacity = Integer.parseInt(writeCap);
         getConf().setInt(S3GUARD_DDB_TABLE_CAPACITY_WRITE_KEY, writeCapacity);
@@ -565,7 +573,25 @@ public abstract class S3GuardTool extends Configured implements Tool,
         setConf(bucketConf);
       }
 
-      String tags = getCommandFormat().getOptValue(TAG_FLAG);
+      String cmk = commands.getOptValue(CMK_FLAG);
+      if (commands.getOpt(SSE_FLAG)) {
+        getConf().setBoolean(S3GUARD_DDB_TABLE_SSE_ENABLED, true);
+        LOG.debug("SSE flag is passed to command {}", this.getName());
+        if (!StringUtils.isEmpty(cmk)) {
+          if (SSE_DEFAULT_MASTER_KEY.equals(cmk)) {
+            LOG.warn("Ignoring default DynamoDB table KMS Master Key " +
+                "alias/aws/dynamodb in configuration");
+          } else {
+            LOG.debug("Setting customer managed CMK {}", cmk);
+            getConf().set(S3GUARD_DDB_TABLE_SSE_CMK, cmk);
+          }
+        }
+      } else if (!StringUtils.isEmpty(cmk)) {
+        throw invalidArgs("Option %s can only be used with option %s",
+            CMK_FLAG, SSE_FLAG);
+      }
+
+      String tags = commands.getOptValue(TAG_FLAG);
       if (tags != null && !tags.isEmpty()) {
         String[] stringList = tags.split(";");
         Map<String, String> tagsKV = new HashMap<>();
@@ -994,7 +1020,7 @@ public abstract class S3GuardTool extends Configured implements Tool,
      * @throws IOException on I/O errors.
      */
     private void compareRoot(Path path, PrintStream out) throws IOException {
-      Path qualified = getFilesystem().qualify(path);
+      Path qualified = getFilesystem().makeQualified(path);
       FileStatus s3Status = null;
       try {
         s3Status = getFilesystem().getFileStatus(qualified);
@@ -1025,7 +1051,7 @@ public abstract class S3GuardTool extends Configured implements Tool,
       } else {
         root = new Path(uri.getPath());
       }
-      root = getFilesystem().qualify(root);
+      root = getFilesystem().makeQualified(root);
       compareRoot(root, out);
       out.flush();
       return SUCCESS;
@@ -1584,6 +1610,7 @@ public abstract class S3GuardTool extends Configured implements Tool,
   static class Fsck extends S3GuardTool {
     public static final String CHECK_FLAG = "check";
     public static final String DDB_MS_CONSISTENCY_FLAG = "internal";
+    public static final String FIX_FLAG = "fix";
 
     public static final String NAME = "fsck";
     public static final String PURPOSE = "Compares S3 with MetadataStore, and "
@@ -1593,12 +1620,17 @@ public abstract class S3GuardTool extends Configured implements Tool,
         "\t" + PURPOSE + "\n\n" +
         "Common options:\n" +
         "  -" + CHECK_FLAG + " Check the metadata store for errors, but do "
-        + "not fix any issues.\n"+
+        + "not fix any issues.\n" +
         "  -" + DDB_MS_CONSISTENCY_FLAG + " Check the dynamodb metadata store "
-        + "for internal consistency.\n";
+        + "for internal consistency.\n" +
+        "  -" + FIX_FLAG + " Fix the errors found in the metadata store. Can " +
+        "be used with " + CHECK_FLAG + " or " + DDB_MS_CONSISTENCY_FLAG + " flags. "
+        + "\n\t\tFixes: \n" +
+        "\t\t\t- Remove orphan entries from DDB." +
+        "\n";
 
     Fsck(Configuration conf) {
-      super(conf, CHECK_FLAG, DDB_MS_CONSISTENCY_FLAG);
+      super(conf, CHECK_FLAG, DDB_MS_CONSISTENCY_FLAG, FIX_FLAG);
     }
 
     @Override
@@ -1623,16 +1655,18 @@ public abstract class S3GuardTool extends Configured implements Tool,
       final CommandFormat commandFormat = getCommandFormat();
 
       // check if there's more than one arguments
-      int flags = 0;
-      if (commandFormat.getOpt(CHECK_FLAG)) {
-        flags++;
-      }
-      if (commandFormat.getOpt(DDB_MS_CONSISTENCY_FLAG)) {
-        flags++;
-      }
+      // from CHECK and INTERNAL CONSISTENCY
+      int flags = countTrue(commandFormat.getOpt(CHECK_FLAG),
+          commandFormat.getOpt(DDB_MS_CONSISTENCY_FLAG));
       if (flags > 1) {
         out.println(USAGE);
         throw invalidArgs("There should be only one parameter used for checking.");
+      }
+      if (flags == 0 && commandFormat.getOpt(FIX_FLAG)) {
+        errorln(FIX_FLAG + " flag can be used with either " + CHECK_FLAG + " or " +
+            DDB_MS_CONSISTENCY_FLAG + " flag, but not alone.");
+        errorln(USAGE);
+        return ERROR;
       }
 
       String s3Path = paths.get(0);
@@ -1682,6 +1716,11 @@ public abstract class S3GuardTool extends Configured implements Tool,
         return ERROR;
       }
 
+      if (commandFormat.getOpt(FIX_FLAG)) {
+        S3GuardFsck s3GuardFsck = new S3GuardFsck(fs, ms);
+        s3GuardFsck.fixViolations(violations);
+      }
+
       out.flush();
 
       // We fail if there were compare pairs, as the returned compare pairs
@@ -1690,6 +1729,10 @@ public abstract class S3GuardTool extends Configured implements Tool,
         exitValue = EXIT_FAIL;
       }
       return exitValue;
+    }
+
+    int countTrue(Boolean... bools) {
+      return (int) Arrays.stream(bools).filter(p -> p).count();
     }
   }
   /**

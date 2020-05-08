@@ -47,6 +47,7 @@ import org.apache.hadoop.fs.permission.AclStatus;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.DFSUtilClient;
 import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
 import org.apache.hadoop.hdfs.protocol.FsPermissionExtension;
@@ -263,7 +264,7 @@ public class HttpFSFileSystem extends FileSystem
     RENAMESNAPSHOT(HTTP_PUT), GETSNAPSHOTDIFF(HTTP_GET),
     GETSNAPSHOTTABLEDIRECTORYLIST(HTTP_GET), GETSERVERDEFAULTS(HTTP_GET),
     CHECKACCESS(HTTP_GET), SETECPOLICY(HTTP_PUT), GETECPOLICY(
-        HTTP_GET), UNSETECPOLICY(HTTP_POST);
+        HTTP_GET), UNSETECPOLICY(HTTP_POST), SATISFYSTORAGEPOLICY(HTTP_PUT);
 
     private String httpMethod;
 
@@ -801,6 +802,11 @@ public class HttpFSFileSystem extends FileSystem
    */
   @Override
   public void setWorkingDirectory(Path newDir) {
+    String result = newDir.toUri().getPath();
+    if (!DFSUtilClient.isValidName(result)) {
+      throw new IllegalArgumentException(
+          "Invalid DFS directory name " + result);
+    }
     workingDir = newDir;
   }
 
@@ -1135,6 +1141,8 @@ public class HttpFSFileSystem extends FileSystem
             .owner((String) json.get(OWNER_JSON))
             .group((String) json.get(GROUP_JSON))
             .stickyBit((Boolean) json.get(ACL_STICKY_BIT_JSON));
+    final FsPermission permission = toFsPermission(json);
+    aclStatusBuilder.setPermission(permission);
     JSONArray entries = (JSONArray) json.get(ACL_ENTRIES_JSON);
     for ( Object e : entries ) {
       aclStatusBuilder.addEntry(AclEntry.parseAclEntry(e.toString(), true));
@@ -1654,6 +1662,15 @@ public class HttpFSFileSystem extends FileSystem
     params.put(OP_PARAM, Operation.UNSETECPOLICY.toString());
     HttpURLConnection conn =
         getConnection(Operation.UNSETECPOLICY.getMethod(), params, path, true);
+    HttpExceptionUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
+  }
+
+  @Override
+  public void satisfyStoragePolicy(final Path path) throws IOException {
+    Map<String, String> params = new HashMap<String, String>();
+    params.put(OP_PARAM, Operation.SATISFYSTORAGEPOLICY.toString());
+    HttpURLConnection conn = getConnection(
+        Operation.SATISFYSTORAGEPOLICY.getMethod(), params, path, true);
     HttpExceptionUtils.validateResponse(conn, HttpURLConnection.HTTP_OK);
   }
 }

@@ -20,10 +20,10 @@ package org.apache.hadoop.fs.azurebfs;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
 import java.util.Map;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
@@ -40,15 +40,16 @@ import org.apache.hadoop.fs.azurebfs.contracts.exceptions.AzureBlobFileSystemExc
 import org.apache.hadoop.fs.azurebfs.contracts.exceptions.ConfigurationPropertyNotFoundException;
 import org.apache.hadoop.fs.azurebfs.contracts.exceptions.InvalidConfigurationValueException;
 import org.apache.hadoop.fs.azurebfs.contracts.exceptions.KeyProviderException;
+import org.apache.hadoop.fs.azurebfs.contracts.exceptions.SASTokenProviderException;
 import org.apache.hadoop.fs.azurebfs.contracts.exceptions.TokenAccessProviderException;
 import org.apache.hadoop.fs.azurebfs.diagnostics.Base64StringConfigurationBasicValidator;
 import org.apache.hadoop.fs.azurebfs.diagnostics.BooleanConfigurationBasicValidator;
 import org.apache.hadoop.fs.azurebfs.diagnostics.IntegerConfigurationBasicValidator;
 import org.apache.hadoop.fs.azurebfs.diagnostics.LongConfigurationBasicValidator;
 import org.apache.hadoop.fs.azurebfs.diagnostics.StringConfigurationBasicValidator;
-import org.apache.hadoop.fs.azurebfs.extensions.AbfsAuthorizationException;
-import org.apache.hadoop.fs.azurebfs.extensions.AbfsAuthorizer;
+import org.apache.hadoop.fs.azurebfs.enums.Trilean;
 import org.apache.hadoop.fs.azurebfs.extensions.CustomTokenProviderAdaptee;
+import org.apache.hadoop.fs.azurebfs.extensions.SASTokenProvider;
 import org.apache.hadoop.fs.azurebfs.oauth2.AccessTokenProvider;
 import org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider;
 import org.apache.hadoop.fs.azurebfs.oauth2.CustomTokenProviderAdapter;
@@ -81,6 +82,10 @@ public class AbfsConfiguration{
   private final boolean isSecure;
   private static final Logger LOG = LoggerFactory.getLogger(AbfsConfiguration.class);
 
+  @StringConfigurationValidatorAnnotation(ConfigurationKey = FS_AZURE_ACCOUNT_IS_HNS_ENABLED,
+      DefaultValue = DEFAULT_FS_AZURE_ACCOUNT_IS_HNS_ENABLED)
+  private String isNamespaceEnabledAccount;
+
   @IntegerConfigurationValidatorAnnotation(ConfigurationKey = AZURE_WRITE_BUFFER_SIZE,
       MinValue = MIN_BUFFER_SIZE,
       MaxValue = MAX_BUFFER_SIZE,
@@ -110,6 +115,11 @@ public class AbfsConfiguration{
       DefaultValue = DEFAULT_MAX_RETRY_ATTEMPTS)
   private int maxIoRetries;
 
+  @IntegerConfigurationValidatorAnnotation(ConfigurationKey = AZURE_CUSTOM_TOKEN_FETCH_RETRY_COUNT,
+      MinValue = 0,
+      DefaultValue = DEFAULT_CUSTOM_TOKEN_FETCH_RETRY_COUNT)
+  private int customTokenFetchRetryCount;
+
   @LongConfigurationValidatorAnnotation(ConfigurationKey = AZURE_BLOCK_SIZE_PROPERTY_NAME,
       MinValue = 0,
       MaxValue = MAX_AZURE_BLOCK_SIZE,
@@ -124,6 +134,11 @@ public class AbfsConfiguration{
       MinValue = 1,
       DefaultValue = MAX_CONCURRENT_WRITE_THREADS)
   private int maxConcurrentWriteThreads;
+
+  @IntegerConfigurationValidatorAnnotation(ConfigurationKey = AZURE_LIST_MAX_RESULTS,
+      MinValue = 1,
+      DefaultValue = DEFAULT_AZURE_LIST_MAX_RESULTS)
+  private int listMaxResults;
 
   @IntegerConfigurationValidatorAnnotation(ConfigurationKey = AZURE_CONCURRENT_CONNECTION_VALUE_IN,
       MinValue = 1,
@@ -163,16 +178,21 @@ public class AbfsConfiguration{
   private boolean enableAutoThrottling;
 
   @StringConfigurationValidatorAnnotation(ConfigurationKey = FS_AZURE_USER_AGENT_PREFIX_KEY,
-      DefaultValue = "")
+      DefaultValue = DEFAULT_FS_AZURE_USER_AGENT_PREFIX)
   private String userAgentId;
+
+  @StringConfigurationValidatorAnnotation(ConfigurationKey = FS_AZURE_CLUSTER_NAME,
+      DefaultValue = DEFAULT_VALUE_UNKNOWN)
+  private String clusterName;
+
+  @StringConfigurationValidatorAnnotation(ConfigurationKey = FS_AZURE_CLUSTER_TYPE,
+      DefaultValue = DEFAULT_VALUE_UNKNOWN)
+  private String clusterType;
 
   @BooleanConfigurationValidatorAnnotation(ConfigurationKey = FS_AZURE_ENABLE_DELEGATION_TOKEN,
       DefaultValue = DEFAULT_ENABLE_DELEGATION_TOKEN)
   private boolean enableDelegationToken;
 
-  @StringConfigurationValidatorAnnotation(ConfigurationKey = ABFS_EXTERNAL_AUTHORIZATION_CLASS,
-      DefaultValue = "")
-  private String abfsExternalAuthorizationClass;
 
   @BooleanConfigurationValidatorAnnotation(ConfigurationKey = FS_AZURE_ALWAYS_USE_HTTPS,
           DefaultValue = DEFAULT_ENABLE_HTTPS)
@@ -215,6 +235,18 @@ public class AbfsConfiguration{
         field.set(this, validateBoolean(field));
       }
     }
+  }
+
+  public Trilean getIsNamespaceEnabledAccount() {
+    return Trilean.getTrilean(isNamespaceEnabledAccount);
+  }
+
+  /**
+   * Gets the Azure Storage account name corresponding to this instance of configuration.
+   * @return the Azure Storage account name
+   */
+  public String getAccountName() {
+    return accountName;
   }
 
   /**
@@ -407,6 +439,10 @@ public class AbfsConfiguration{
     return this.maxIoRetries;
   }
 
+  public int getCustomTokenFetchRetryCount() {
+    return this.customTokenFetchRetryCount;
+  }
+
   public long getAzureBlockSize() {
     return this.azureBlockSize;
   }
@@ -427,6 +463,10 @@ public class AbfsConfiguration{
     return this.maxConcurrentReadThreads;
   }
 
+  public int getListMaxResults() {
+    return this.listMaxResults;
+  }
+
   public boolean getTolerateOobAppends() {
     return this.tolerateOobAppends;
   }
@@ -436,7 +476,9 @@ public class AbfsConfiguration{
   }
 
   public boolean getCreateRemoteFileSystemDuringInitialization() {
-    return this.createRemoteFileSystemDuringInitialization;
+    // we do not support creating the filesystem when AuthType is SAS
+    return this.createRemoteFileSystemDuringInitialization
+        && this.getAuthType(this.accountName) != AuthType.SAS;
   }
 
   public boolean getSkipUserGroupMetadataDuringInitialization() {
@@ -461,6 +503,14 @@ public class AbfsConfiguration{
 
   public String getCustomUserAgentPrefix() {
     return this.userAgentId;
+  }
+
+  public String getClusterName() {
+    return this.clusterName;
+  }
+
+  public String getClusterType() {
+    return this.clusterType;
   }
 
   public DelegatingSSLSocketFactory.SSLChannelMode getPreferredSSLFactoryOption() {
@@ -565,7 +615,7 @@ public class AbfsConfiguration{
         LOG.trace("Initializing {}", customTokenProviderClass.getName());
         azureTokenProvider.initialize(rawConfig, accountName);
         LOG.trace("{} init complete", customTokenProviderClass.getName());
-        return new CustomTokenProviderAdapter(azureTokenProvider);
+        return new CustomTokenProviderAdapter(azureTokenProvider, getCustomTokenFetchRetryCount());
       } catch(IllegalArgumentException e) {
         throw e;
       } catch (Exception e) {
@@ -578,35 +628,32 @@ public class AbfsConfiguration{
     }
   }
 
-  public String getAbfsExternalAuthorizationClass() {
-    return this.abfsExternalAuthorizationClass;
-  }
-
-  public AbfsAuthorizer getAbfsAuthorizer() throws IOException {
-    String authClassName = getAbfsExternalAuthorizationClass();
-    AbfsAuthorizer authorizer = null;
+  public SASTokenProvider getSASTokenProvider() throws AzureBlobFileSystemException {
+    AuthType authType = getEnum(FS_AZURE_ACCOUNT_AUTH_TYPE_PROPERTY_NAME, AuthType.SharedKey);
+    if (authType != AuthType.SAS) {
+      throw new SASTokenProviderException(String.format(
+        "Invalid auth type: %s is being used, expecting SAS", authType));
+    }
 
     try {
-      if (authClassName != null && !authClassName.isEmpty()) {
-        @SuppressWarnings("unchecked")
-        Class<AbfsAuthorizer> authClass = (Class<AbfsAuthorizer>) rawConfig.getClassByName(authClassName);
-        authorizer = authClass.getConstructor(new Class[] {Configuration.class}).newInstance(rawConfig);
-        LOG.trace("Initializing {}", authClassName);
-        authorizer.init();
-        LOG.trace("{} init complete", authClassName);
-      }
-    } catch (
-        IllegalAccessException
-        | InstantiationException
-        | ClassNotFoundException
-        | IllegalArgumentException
-        | InvocationTargetException
-        | NoSuchMethodException
-        | SecurityException
-        | AbfsAuthorizationException e) {
-      throw new IOException(e);
+      String configKey = FS_AZURE_SAS_TOKEN_PROVIDER_TYPE;
+      Class<? extends SASTokenProvider> sasTokenProviderClass =
+          getClass(configKey, null, SASTokenProvider.class);
+      Preconditions.checkArgument(sasTokenProviderClass != null,
+          String.format("The configuration value for \"%s\" is invalid.", configKey));
+
+      SASTokenProvider sasTokenProvider = ReflectionUtils
+          .newInstance(sasTokenProviderClass, rawConfig);
+      Preconditions.checkArgument(sasTokenProvider != null,
+          String.format("Failed to initialize %s", sasTokenProviderClass));
+
+      LOG.trace("Initializing {}", sasTokenProviderClass.getName());
+      sasTokenProvider.initialize(rawConfig, accountName);
+      LOG.trace("{} init complete", sasTokenProviderClass.getName());
+      return sasTokenProvider;
+    } catch (Exception e) {
+      throw new TokenAccessProviderException("Unable to load SAS token provider class: " + e, e);
     }
-    return authorizer;
   }
 
   void validateStorageAccountKeys() throws InvalidConfigurationValueException {
@@ -696,6 +743,21 @@ public class AbfsConfiguration{
   @VisibleForTesting
   void setDisableOutputStreamFlush(boolean disableOutputStreamFlush) {
     this.disableOutputStreamFlush = disableOutputStreamFlush;
+  }
+
+  @VisibleForTesting
+  void setListMaxResults(int listMaxResults) {
+    this.listMaxResults = listMaxResults;
+  }
+
+  @VisibleForTesting
+  public void setMaxIoRetries(int maxIoRetries) {
+    this.maxIoRetries = maxIoRetries;
+  }
+
+  @VisibleForTesting
+  void setIsNamespaceEnabledAccount(String isNamespaceEnabledAccount) {
+    this.isNamespaceEnabledAccount = isNamespaceEnabledAccount;
   }
 
   private String getTrimmedPasswordString(String key, String defaultValue) throws IOException {

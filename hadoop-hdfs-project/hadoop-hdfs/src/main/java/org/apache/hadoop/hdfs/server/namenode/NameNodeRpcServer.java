@@ -102,6 +102,7 @@ import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.DirectoryListing;
 import org.apache.hadoop.hdfs.protocol.ECBlockGroupStats;
+import org.apache.hadoop.hdfs.protocol.ECTopologyVerifierResult;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
 import org.apache.hadoop.hdfs.protocol.EncryptionZone;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicyInfo;
@@ -226,7 +227,7 @@ import org.apache.hadoop.util.VersionUtil;
 import org.slf4j.Logger;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.protobuf.BlockingService;
+import org.apache.hadoop.thirdparty.protobuf.BlockingService;
 
 import javax.annotation.Nonnull;
 
@@ -1899,17 +1900,6 @@ public class NameNodeRpcServer implements NamenodeProtocols {
     return clientMachine;
   }
 
-  /**
-   * Return the QOP of the client that the current handler thread
-   * is handling. Assuming the negotiation is done at this point,
-   * otherwise returns null.
-   *
-   * @return the established QOP of this client.
-   */
-  public static String getEstablishedClientQOP() {
-    return Server.getEstablishedQOP();
-  }
-
   @Override
   public DataEncryptionKey getDataEncryptionKey() throws IOException {
     checkNNStartup();
@@ -2528,6 +2518,12 @@ public class NameNodeRpcServer implements NamenodeProtocols {
     } finally {
       RetryCache.setState(cacheEntry, success);
     }
+  }
+
+  @Override
+  public ECTopologyVerifierResult getECTopologyResultForPolicies(
+      String... policyNames) throws IOException {
+    return namesystem.getECTopologyResultForPolicies(policyNames);
   }
 
   @Override

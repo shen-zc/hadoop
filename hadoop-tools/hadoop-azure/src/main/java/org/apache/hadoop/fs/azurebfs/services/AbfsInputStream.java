@@ -25,16 +25,22 @@ import java.net.HttpURLConnection;
 
 import com.google.common.base.Preconditions;
 
+import org.apache.hadoop.fs.CanUnbuffer;
 import org.apache.hadoop.fs.FSExceptionMessages;
 import org.apache.hadoop.fs.FSInputStream;
 import org.apache.hadoop.fs.FileSystem.Statistics;
+import org.apache.hadoop.fs.StreamCapabilities;
 import org.apache.hadoop.fs.azurebfs.contracts.exceptions.AbfsRestOperationException;
 import org.apache.hadoop.fs.azurebfs.contracts.exceptions.AzureBlobFileSystemException;
+
+import static org.apache.hadoop.util.StringUtils.toLowerCase;
 
 /**
  * The AbfsInputStream for AbfsClient.
  */
-public class AbfsInputStream extends FSInputStream {
+public class AbfsInputStream extends FSInputStream implements CanUnbuffer,
+        StreamCapabilities {
+
   private final AbfsClient client;
   private final Statistics statistics;
   private final String path;
@@ -55,21 +61,19 @@ public class AbfsInputStream extends FSInputStream {
   private boolean closed = false;
 
   public AbfsInputStream(
-      final AbfsClient client,
-      final Statistics statistics,
-      final String path,
-      final long contentLength,
-      final int bufferSize,
-      final int readAheadQueueDepth,
-      final boolean tolerateOobAppends,
-      final String eTag) {
+          final AbfsClient client,
+          final Statistics statistics,
+          final String path,
+          final long contentLength,
+          final AbfsInputStreamContext abfsInputStreamContext,
+          final String eTag) {
     this.client = client;
     this.statistics = statistics;
     this.path = path;
     this.contentLength = contentLength;
-    this.bufferSize = bufferSize;
-    this.readAheadQueueDepth = (readAheadQueueDepth >= 0) ? readAheadQueueDepth : Runtime.getRuntime().availableProcessors();
-    this.tolerateOobAppends = tolerateOobAppends;
+    this.bufferSize = abfsInputStreamContext.getReadBufferSize();
+    this.readAheadQueueDepth = abfsInputStreamContext.getReadAheadQueueDepth();
+    this.tolerateOobAppends = abfsInputStreamContext.isTolerateOobAppends();
     this.eTag = eTag;
     this.readAheadEnabled = true;
   }
@@ -95,6 +99,7 @@ public class AbfsInputStream extends FSInputStream {
     int currentLen = len;
     int lastReadBytes;
     int totalReadBytes = 0;
+    incrementReadOps();
     do {
       lastReadBytes = readOneBlock(b, currentOff, currentLen);
       if (lastReadBytes > 0) {
@@ -195,6 +200,7 @@ public class AbfsInputStream extends FSInputStream {
       // try reading from buffers first
       receivedBytes = ReadBufferManager.getBufferManager().getBlock(this, position, length, b);
       if (receivedBytes > 0) {
+        incrementReadOps();
         return receivedBytes;
       }
 
@@ -230,6 +236,7 @@ public class AbfsInputStream extends FSInputStream {
     try (AbfsPerfInfo perfInfo = new AbfsPerfInfo(tracker, "readRemote", "read")) {
       op = client.read(path, position, b, offset, length, tolerateOobAppends ? "*" : eTag);
       perfInfo.registerResult(op.getResult()).registerSuccess(true);
+      incrementReadOps();
     } catch (AzureBlobFileSystemException ex) {
       if (ex instanceof AbfsRestOperationException) {
         AbfsRestOperationException ere = (AbfsRestOperationException) ex;
@@ -244,6 +251,15 @@ public class AbfsInputStream extends FSInputStream {
       throw new IOException("Unexpected Content-Length");
     }
     return (int) bytesRead;
+  }
+
+  /**
+   * Increment Read Operations.
+   */
+  private void incrementReadOps() {
+    if (statistics != null) {
+      statistics.incrementReadOps(1);
+    }
   }
 
   /**
@@ -389,5 +405,24 @@ public class AbfsInputStream extends FSInputStream {
   @Override
   public boolean markSupported() {
     return false;
+  }
+
+  @Override
+  public synchronized void unbuffer() {
+    buffer = null;
+    // Preserve the original position returned by getPos()
+    fCursor = fCursor - limit + bCursor;
+    fCursorAfterLastRead = -1;
+    bCursor = 0;
+    limit = 0;
+  }
+
+  @Override
+  public boolean hasCapability(String capability) {
+    return StreamCapabilities.UNBUFFER.equals(toLowerCase(capability));
+  }
+
+  byte[] getBuffer() {
+    return buffer;
   }
 }
